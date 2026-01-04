@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel-art-diffusion"
+version = "1.0.0"
+description = "Pixel art diffusion models and training"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "torchvision",
+    "tqdm",
+    "numpy",
+    "Pillow",
+    "matplotlib",
+    "pandas",
+    "tensorboard",
+]
+
+[tool.setuptools]
+py-modules = ["dataloader", "model", "train"]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }

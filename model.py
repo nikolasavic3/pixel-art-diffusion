@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# --- 1. Basic Building Blocks ---
-
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -19,219 +17,151 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
-class Block(nn.Module):
-    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1):
-        super().__init__()
-        self.time_mlp = nn.Linear(time_emb_dim, out_ch)
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.transform = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.bn = nn.GroupNorm(8, out_ch)
-        self.act = nn.SiLU()
-        self.drop = nn.Dropout(dropout)
-        self.res_conv = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-
-    def forward(self, x, t):
-        h = self.conv1(x)
-        h = self.act(self.bn(h))
-        # Add time/label embedding
-        time_emb = self.act(self.time_mlp(t))
-        time_emb = time_emb[(..., ) + (None, ) * 2]
-        h = h + time_emb
-        h = self.transform(h)
-        h = self.act(h)
-        return h + self.res_conv(x)
-
-class SelfAttention(nn.Module):
-    def __init__(self, channels):
+class AttentionBlock(nn.Module):
+    def __init__(self, channels, emb_dim):
         super().__init__()
         self.channels = channels
         self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
         self.ln = nn.LayerNorm([channels])
-        self.ff_self = nn.Sequential(
-            nn.LayerNorm([channels]),
-            nn.Linear(channels, channels),
-            nn.GELU(),
-            nn.Linear(channels, channels),
-        )
+        self.kv_proj = nn.Linear(emb_dim, channels * 2)
 
-    def forward(self, x):
-        size = x.shape[-2:]
-        x = x.view(-1, self.channels, size[0] * size[1]).swapaxes(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, size[0], size[1])
+    def forward(self, x, cond_emb):
+        b, c, h, w = x.shape
+        x_flat = x.view(b, c, h * w).permute(0, 2, 1)
+        x_ln = self.ln(x_flat)
+        
+        kv = self.kv_proj(cond_emb).unsqueeze(1)
+        k, v = kv.chunk(2, dim=-1)
+        
+        attn_out, _ = self.mha(query=x_ln, key=k, value=v)
+        x_flat = x_flat + attn_out
+        return x_flat.permute(0, 2, 1).view(b, c, h, w)
 
-# --- 2. Conditional Tiny U-Net ---
-
-class ConditionalTinyPixelUNet(nn.Module):
-    def __init__(self, num_classes, img_size=16, c_in=3, c_out=3, base_c=32, time_dim=128):
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_dim):
         super().__init__()
-        self.img_size = img_size
-        
-        # 1. Label Embedding (Maps class ID to a vector)
-        # num_classes + 1 covers the actual classes + the "null/unconditional" token
-        self.label_emb = nn.Embedding(num_classes + 1, time_dim)
-        
-        # Time Embedding
-        self.time_dim = time_dim
-        self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(time_dim),
-            nn.Linear(time_dim, time_dim),
-            nn.ReLU()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.bn1 = nn.GroupNorm(8, out_ch)
+        self.time_mlp = nn.Linear(t_dim, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.bn2 = nn.GroupNorm(8, out_ch)
+        self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t):
+        h = F.silu(self.bn1(self.conv1(x)))
+        t_emb = self.time_mlp(F.silu(t))[(...,) + (None,) * 2]
+        h = self.bn2(self.conv2(h + t_emb))
+        return F.silu(h + self.shortcut(x))
+
+class ScalableUNet(nn.Module):
+    def __init__(self, num_classes, img_size=16, base_c=128, t_dim=256):
+        super().__init__()
+        self.t_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(t_dim),
+            nn.Linear(t_dim, t_dim),
+            nn.SiLU()
         )
+        self.label_emb = nn.Embedding(num_classes + 1, t_dim)
         
-        # Initial Projection
-        self.conv_in = nn.Conv2d(c_in, base_c, 3, padding=1)
+        # Encoder
+        self.init_conv = nn.Conv2d(3, base_c, 3, padding=1)
+        self.down1 = ResBlock(base_c, base_c, t_dim)          # Output: base_c
+        self.down2 = ResBlock(base_c, base_c * 2, t_dim)      # Output: base_c * 2
         
-        # Downsampling
-        self.down1 = Block(base_c, base_c * 2, time_dim)
-        self.pool1 = nn.Conv2d(base_c * 2, base_c * 2, 4, 2, 1)
+        # Mid
+        self.mid_attn = AttentionBlock(base_c * 2, t_dim)
+        self.mid_res = ResBlock(base_c * 2, base_c * 2, t_dim)
         
-        self.down2 = Block(base_c * 2, base_c * 4, time_dim)
-        self.pool2 = nn.Conv2d(base_c * 4, base_c * 4, 4, 2, 1)
+        # Decoder
+        # Concatenation logic: 
+        # up1_in = mid_res_out (base_c * 2) + down2_out (base_c * 2) = base_c * 4
+        self.up1 = ResBlock(base_c * 4, base_c * 2, t_dim)
         
-        # Bottleneck
-        self.bot1 = Block(base_c * 4, base_c * 4, time_dim)
-        self.attn = SelfAttention(base_c * 4)
-        self.bot2 = Block(base_c * 4, base_c * 4, time_dim)
+        # up2_in = up1_out (base_c * 2) + down1_out (base_c) = base_c * 3
+        self.up2 = ResBlock(base_c * 3, base_c, t_dim)
         
-        # Upsampling
-        self.up1 = nn.ConvTranspose2d(base_c * 4, base_c * 2, 4, 2, 1)
-        self.up_block1 = Block(base_c * 4 + base_c * 2, base_c * 2, time_dim)
-        
-        self.up2 = nn.ConvTranspose2d(base_c * 2, base_c, 4, 2, 1)
-        self.up_block2 = Block(base_c * 2 + base_c, base_c, time_dim)
-        
-        self.conv_out = nn.Conv2d(base_c, c_out, 3, padding=1)
+        self.final_attn = AttentionBlock(base_c, t_dim)
+        self.out = nn.Conv2d(base_c, 3, 3, padding=1)
 
     def forward(self, x, t, labels):
-        # Embed Time
-        t_emb = self.time_mlp(t)
+        t_vec = self.t_mlp(t)
+        l_vec = self.label_emb(labels)
+        c_vec = t_vec + l_vec 
         
-        # Embed Label and Add to Time
-        # This is a lightweight way to condition the entire network
-        l_emb = self.label_emb(labels)
+        # Encoder
+        x1 = self.init_conv(x)         # [B, base_c, 16, 16]
+        x1_res = self.down1(x1, c_vec) # [B, base_c, 16, 16]
         
-        # Combine (Simple addition works surprisingly well for small models)
-        # t_emb becomes the carrier for both "how noisy is it?" and "what object is it?"
-        cond_emb = t_emb + l_emb
+        x2_in = F.avg_pool2d(x1_res, 2) # [B, base_c, 8, 8]
+        x2_res = self.down2(x2_in, c_vec) # [B, base_c * 2, 8, 8]
         
-        x = self.conv_in(x)
+        # Mid
+        x_mid = self.mid_attn(x2_res, l_vec)
+        x_mid = self.mid_res(x_mid, c_vec)
         
-        x1 = self.down1(x, cond_emb)
-        x_down = self.pool1(x1)
+        # Decoder
+        # 1. Up to 8x8 (already 8x8, but conceptually we process)
+        # Concatenate x_mid (base_c*2) with x2_res (base_c*2)
+        x_up1 = torch.cat([x_mid, x2_res], dim=1) # [B, base_c * 4, 8, 8]
+        x_up1 = self.up1(x_up1, c_vec)            # [B, base_c * 2, 8, 8]
         
-        x2 = self.down2(x_down, cond_emb)
-        x_down = self.pool2(x2)
+        # 2. Up to 16x16
+        x_up2_in = F.interpolate(x_up1, scale_factor=2, mode='nearest') # [B, base_c * 2, 16, 16]
+        x_up2_in = torch.cat([x_up2_in, x1_res], dim=1)                 # [B, base_c * 3, 16, 16]
+        x_up2 = self.up2(x_up2_in, c_vec)                               # [B, base_c, 16, 16]
         
-        x_bot = self.bot1(x_down, cond_emb)
-        x_bot = self.attn(x_bot)
-        x_bot = self.bot2(x_bot, cond_emb)
-        
-        x_up = self.up1(x_bot)
-        if x_up.shape != x2.shape: x_up = F.interpolate(x_up, size=x2.shape[2:])
-        x_up = torch.cat([x_up, x2], dim=1)
-        x_up = self.up_block1(x_up, cond_emb)
-        
-        x_up = self.up2(x_up)
-        if x_up.shape != x1.shape: x_up = F.interpolate(x_up, size=x1.shape[2:])
-        x_up = torch.cat([x_up, x1], dim=1)
-        x_up = self.up_block2(x_up, cond_emb)
-        
-        return self.conv_out(x_up)
-
-# --- 3. Diffusion Manager ---
+        x_final = self.final_attn(x_up2, l_vec)
+        return self.out(x_final)
 
 class PixelDiffusion:
-    def __init__(self, model, image_size=16, device="cpu", n_steps=1000):
+    def __init__(self, model, image_size=16, device="cpu"):
         self.model = model.to(device)
         self.image_size = image_size
         self.device = device
-        self.n_steps = n_steps
-        self.beta = torch.linspace(1e-4, 0.02, n_steps).to(device)
-        self.alpha = 1. - self.beta
-        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+        self.betas = torch.linspace(1e-4, 0.04, 1000).to(device)
+        self.alphas = 1. - self.betas
+        self.alpha_hat = torch.cumprod(self.alphas, dim=0)
 
-    def noise_images(self, x, t):
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
-        eps = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * eps, eps
-
-    def sample_timesteps(self, n):
-        return torch.randint(low=1, high=self.n_steps, size=(n,)).to(self.device)
-
-    def train_step(self, images, labels, optimizer, loss_fn, unconditional_prob=0.1):
-        """
-        Train with Random Null-Label Masking for CFG.
-        """
+    def train_step(self, images, labels, optimizer, loss_fn):
         self.model.train()
         n = images.shape[0]
-        t = self.sample_timesteps(n)
-        x_t, noise = self.noise_images(images, t)
+        t = torch.randint(0, 1000, (n,), device=self.device).long()
         
-        # Randomly mask labels with 0 (null token)
-        # This teaches the model to generate even without a specific prompt
-        if torch.rand(1).item() < unconditional_prob:
-            labels = torch.zeros_like(labels).to(self.device)
-            
-        predicted_noise = self.model(x_t, t, labels)
-        loss = loss_fn(noise, predicted_noise)
+        alpha_t = self.alpha_hat[t][:, None, None, None]
+        noise = torch.randn_like(images)
+        x_t = torch.sqrt(alpha_t) * images + torch.sqrt(1 - alpha_t) * noise
+        
+        # Drop labels for CFG
+        mask = (torch.rand(n, device=self.device) > 0.15).long()
+        labels = labels * mask
+        
+        pred_noise = self.model(x_t, t, labels)
+        loss = loss_fn(noise, pred_noise)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         return loss.item()
-        
-    def snap_to_palette(self, images, levels=16):
-        return (images * (levels - 1)).round() / (levels - 1)
 
     @torch.no_grad()
-    def sample_with_guidance(self, labels, steps=20, cfg_scale=3.0, snap_colors=True):
-        """
-        Classifier-Free Guidance Sampling.
-        labels: Tensor of class IDs [N]
-        cfg_scale: How hard to force the prompt (3.0 is usually good for pixel art)
-        """
+    def sample(self, labels, cfg_scale=7.5):
         self.model.eval()
-
-        labels = labels.to(device=self.device, dtype=torch.long)
         n = labels.shape[0]
-
         x = torch.randn((n, 3, self.image_size, self.image_size), device=self.device)
-
-        full_steps = torch.linspace(
-            0, self.n_steps - 1, steps + 1, device=self.device
-        ).round().to(dtype=torch.long)
-        full_steps = torch.flip(full_steps, dims=[0])
-
-        for i in range(steps):
-            t_now = int(full_steps[i].item())
-            t_next = int(full_steps[i + 1].item())
-
-            t_batch = torch.full((n,), t_now, device=self.device, dtype=torch.long)
-
-            # Combine inputs to batch them together for speed
-            x_in = torch.cat([x, x], dim=0)
-            t_in = torch.cat([t_batch, t_batch], dim=0)
-            l_in = torch.cat([labels, torch.zeros_like(labels)], dim=0)  # [Label, Null]
-
-            noise_pred = self.model(x_in, t_in, l_in)
-            noise_cond, noise_uncond = noise_pred.chunk(2)
-
-            final_noise = noise_uncond + cfg_scale * (noise_cond - noise_uncond)
-
-            alpha_now = self.alpha_hat[t_now]
-            alpha_next = self.alpha_hat[t_next] if t_next >= 0 else torch.tensor(1.0, device=self.device)
-
-            x0_pred = (x - torch.sqrt(1 - alpha_now) * final_noise) / torch.sqrt(alpha_now)
-            x0_pred = torch.clamp(x0_pred, -1, 1)
-
-            x = torch.sqrt(alpha_next) * x0_pred + torch.sqrt(1 - alpha_next) * final_noise
-
+        
+        for i in reversed(range(1000)):
+            t = (torch.ones(n) * i).long().to(self.device)
+            
+            n_cond = self.model(x, t, labels)
+            n_uncond = self.model(x, t, torch.zeros_like(labels))
+            eps = n_uncond + cfg_scale * (n_cond - n_uncond)
+            
+            a_t = self.alpha_hat[i]
+            a_prev = self.alpha_hat[i-1] if i > 0 else torch.tensor(1.0).to(self.device)
+            beta_t = self.betas[i]
+            
+            noise = torch.randn_like(x) if i > 0 else 0
+            x = (1 / torch.sqrt(self.alphas[i])) * (x - (beta_t / torch.sqrt(1 - a_t)) * eps) + torch.sqrt(beta_t) * noise
+            
         x = (x.clamp(-1, 1) + 1) / 2
-        if snap_colors:
-            x = self.snap_to_palette(x)
-        return x
+        return (x * 15).round() / 15
